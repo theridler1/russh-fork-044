@@ -209,11 +209,11 @@ impl Encoding for CryptoVec {
 /// A cursor-like trait to read SSH-encoded things.
 pub trait Reader {
     /// Create an SSH reader for `self`.
-    fn reader(&self, starting_at: usize) -> Position;
+    fn reader(&self, starting_at: usize) -> Position<'_>;
 }
 
 impl Reader for CryptoVec {
-    fn reader(&self, starting_at: usize) -> Position {
+    fn reader(&self, starting_at: usize) -> Position<'_> {
         Position {
             s: self,
             position: starting_at,
@@ -222,7 +222,7 @@ impl Reader for CryptoVec {
 }
 
 impl Reader for [u8] {
-    fn reader(&self, starting_at: usize) -> Position {
+    fn reader(&self, starting_at: usize) -> Position<'_> {
         Position {
             s: self,
             position: starting_at,

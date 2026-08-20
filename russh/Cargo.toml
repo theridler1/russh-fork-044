@@ -9,7 +9,7 @@ license = "Apache-2.0"
 name = "russh"
 readme = "../README.md"
 repository = "https://github.com/warp-tech/russh"
-version = "0.44.0"
+version = "0.44.1"
 rust-version = "1.65"
 
 [features]
@@ -45,6 +45,7 @@ p521 = { version = "0.13", features = ["ecdh"] }
 poly1305 = "0.8"
 rand = { workspace = true }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+getrandom = "0.2"
 russh-cryptovec = { version = "0.7.0", path = "../cryptovec" }
 russh-keys = { version = "0.44.0", path = "../russh-keys" }
 sha1 = { workspace = true }
@@ -63,6 +64,9 @@ tokio = { workspace = true, features = [
     "process",
 ] }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 anyhow = "1.0"
 env_logger = "0.10"
@@ -79,6 +83,8 @@ tokio = { version = "1.17.0", features = [
 russh-sftp = "2.0.0-beta.2"
 rand = "0.8.5"
 shell-escape = "0.1"
+
+[target.'cfg(unix)'.dev-dependencies]
 tokio-fd = "0.3"
 termion = "2"
 ratatui = "0.26.0"

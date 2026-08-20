@@ -137,8 +137,11 @@ pub struct AuthRequest {
 #[derive(Debug)]
 pub enum CurrentRequest {
     PublicKey {
-        key: CryptoVec,
-        algo: CryptoVec,
+        // Used only for Debug formatting; the auth state machine matches on
+        // the variant and inspects `sent_pk_ok`. Keep the fields rather than
+        // allow(dead_code) so the protocol payload is still recoverable.
+        #[allow(dead_code)] key: CryptoVec,
+        #[allow(dead_code)] algo: CryptoVec,
         sent_pk_ok: bool,
     },
     KeyboardInteractive {

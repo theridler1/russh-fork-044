@@ -18,7 +18,9 @@
 mod curve25519;
 mod dh;
 mod ecdh_nistp;
+mod hybrid_sntrup761;
 mod none;
+mod sntrup761_ffi;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -30,6 +32,7 @@ use dh::{
 };
 use digest::Digest;
 use ecdh_nistp::{EcdhNistP256KexType, EcdhNistP384KexType, EcdhNistP521KexType};
+use hybrid_sntrup761::Sntrup761X25519KexType;
 use once_cell::sync::Lazy;
 
 use crate::cipher::CIPHERS;
@@ -112,6 +115,9 @@ pub const ECDH_SHA2_NISTP256: Name = Name("ecdh-sha2-nistp256");
 pub const ECDH_SHA2_NISTP384: Name = Name("ecdh-sha2-nistp384");
 /// `ecdh-sha2-nistp521`
 pub const ECDH_SHA2_NISTP521: Name = Name("ecdh-sha2-nistp521");
+/// `sntrup761x25519-sha512@openssh.com` — post-quantum hybrid KEX
+/// (SNTRU Prime 761 KEM + X25519 ECDH, with SHA-512 transcript).
+pub const SNTRUP761X25519_SHA512: Name = Name("sntrup761x25519-sha512@openssh.com");
 /// `none`
 pub const NONE: Name = Name("none");
 /// `ext-info-c`
@@ -131,9 +137,11 @@ const _DH_G16_SHA512: DhGroup16Sha512KexType = DhGroup16Sha512KexType {};
 const _ECDH_SHA2_NISTP256: EcdhNistP256KexType = EcdhNistP256KexType {};
 const _ECDH_SHA2_NISTP384: EcdhNistP384KexType = EcdhNistP384KexType {};
 const _ECDH_SHA2_NISTP521: EcdhNistP521KexType = EcdhNistP521KexType {};
+const _SNTRUP761X25519_SHA512: Sntrup761X25519KexType = Sntrup761X25519KexType {};
 const _NONE: none::NoneKexType = none::NoneKexType {};
 
 pub const ALL_KEX_ALGORITHMS: &[&Name] = &[
+    &SNTRUP761X25519_SHA512,
     &CURVE25519,
     &CURVE25519_PRE_RFC_8731,
     &DH_G1_SHA1,
@@ -149,6 +157,7 @@ pub const ALL_KEX_ALGORITHMS: &[&Name] = &[
 pub(crate) static KEXES: Lazy<HashMap<&'static Name, &(dyn KexType + Send + Sync)>> =
     Lazy::new(|| {
         let mut h: HashMap<&'static Name, &(dyn KexType + Send + Sync)> = HashMap::new();
+        h.insert(&SNTRUP761X25519_SHA512, &_SNTRUP761X25519_SHA512);
         h.insert(&CURVE25519, &_CURVE25519);
         h.insert(&CURVE25519_PRE_RFC_8731, &_CURVE25519);
         h.insert(&DH_G16_SHA512, &_DH_G16_SHA512);
