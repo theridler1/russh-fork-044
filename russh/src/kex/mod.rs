@@ -179,8 +179,53 @@ thread_local! {
     static BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
 }
 
+/// How the shared secret K is encoded when it is hashed (RFC 4253 §7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SharedSecretEncoding {
+    /// Classical DH / ECDH / curve25519: K is an `mpint`.
+    Mpint,
+    /// Hybrid PQ KEX (sntrup761x25519-sha512@openssh.com): K is an SSH
+    /// `string`, both in the exchange hash and in key derivation, as in
+    /// OpenSSH's `kexsntrup761x25519.c`.
+    String,
+}
+
+pub(crate) fn encode_shared_secret(
+    buffer: &mut CryptoVec,
+    shared: &[u8],
+    encoding: SharedSecretEncoding,
+) {
+    match encoding {
+        SharedSecretEncoding::Mpint => buffer.extend_ssh_mpint(shared),
+        SharedSecretEncoding::String => buffer.extend_ssh_string(shared),
+    }
+}
+
 pub(crate) fn compute_keys<D: Digest>(
     shared_secret: Option<&[u8]>,
+    session_id: &CryptoVec,
+    exchange_hash: &CryptoVec,
+    cipher: cipher::Name,
+    remote_to_local_mac: mac::Name,
+    local_to_remote_mac: mac::Name,
+    is_server: bool,
+) -> Result<super::cipher::CipherPair, crate::Error> {
+    compute_keys_with_encoding::<D>(
+        shared_secret,
+        SharedSecretEncoding::Mpint,
+        session_id,
+        exchange_hash,
+        cipher,
+        remote_to_local_mac,
+        local_to_remote_mac,
+        is_server,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_keys_with_encoding<D: Digest>(
+    shared_secret: Option<&[u8]>,
+    shared_secret_encoding: SharedSecretEncoding,
     session_id: &CryptoVec,
     exchange_hash: &CryptoVec,
     cipher: cipher::Name,
@@ -207,7 +252,7 @@ pub(crate) fn compute_keys<D: Digest>(
                         key.clear();
 
                         if let Some(shared) = shared_secret {
-                            buffer.extend_ssh_mpint(shared);
+                            encode_shared_secret(&mut buffer, shared, shared_secret_encoding);
                         }
 
                         buffer.extend(exchange_hash.as_ref());
@@ -224,7 +269,7 @@ pub(crate) fn compute_keys<D: Digest>(
                             // extend.
                             buffer.clear();
                             if let Some(shared) = shared_secret {
-                                buffer.extend_ssh_mpint(shared);
+                                encode_shared_secret(&mut buffer, shared, shared_secret_encoding);
                             }
                             buffer.extend(exchange_hash.as_ref());
                             buffer.extend(key);

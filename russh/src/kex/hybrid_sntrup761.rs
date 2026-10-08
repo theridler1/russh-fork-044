@@ -21,7 +21,7 @@ use super::sntrup761_ffi::{
     self, CIPHERTEXT_BYTES as SNTRUP761_CIPHERTEXT_SIZE,
     PUBLICKEY_BYTES as SNTRUP761_PUBLIC_KEY_SIZE,
 };
-use super::{compute_keys, KexAlgorithm, KexType};
+use super::{compute_keys_with_encoding, KexAlgorithm, KexType, SharedSecretEncoding};
 use crate::keys::encoding::Encoding;
 use crate::mac;
 use crate::session::Exchange;
@@ -224,12 +224,13 @@ impl KexAlgorithm for Sntrup761X25519Kex {
         local_to_remote_mac: mac::Name,
         is_server: bool,
     ) -> Result<super::cipher::CipherPair, crate::Error> {
-        // The shared secret feed into compute_keys is encoded with
-        // `extend_ssh_mpint` by `compute_keys` itself (see kex/mod.rs). For
-        // OpenSSH's sntrup761 hybrid the K used for key derivation is also the
-        // 64-byte SHA-512 digest. We pass the digest bytes directly.
-        compute_keys::<sha2::Sha512>(
+        // OpenSSH feeds K into key derivation exactly as it was hashed into
+        // the exchange hash: as an SSH `string`, not an `mpint`. Encoding it
+        // as an mpint here diverged whenever K[0] >= 0x80 (or K[0] == 0),
+        // i.e. ~50% of handshakes died right after NEWKEYS.
+        compute_keys_with_encoding::<sha2::Sha512>(
             self.shared_secret.as_ref().map(|k| &k[..]),
+            SharedSecretEncoding::String,
             session_id,
             exchange_hash,
             cipher,
@@ -243,7 +244,33 @@ impl KexAlgorithm for Sntrup761X25519Kex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use byteorder::{BigEndian, ByteOrder};
+
+    #[test]
+    fn key_derivation_encodes_k_as_ssh_string() {
+        use super::super::encode_shared_secret;
+        // High bit set: an mpint would prepend 0x00 (length 65). OpenSSH
+        // hashes the raw 64-byte string, so the encoding must stay length 64.
+        let mut k = [0x11u8; 64];
+        k[0] = 0x80;
+        let mut buf = CryptoVec::new();
+        encode_shared_secret(&mut buf, &k, SharedSecretEncoding::String);
+        assert_eq!(&buf[..4], &[0, 0, 0, 64]);
+        assert_eq!(&buf[4..], &k[..]);
+
+        // Leading zero: an mpint would strip it; the string keeps it.
+        k[0] = 0x00;
+        let mut buf = CryptoVec::new();
+        encode_shared_secret(&mut buf, &k, SharedSecretEncoding::String);
+        assert_eq!(buf.len(), 68);
+
+        // The classical path still uses mpint.
+        k[0] = 0x80;
+        let mut buf = CryptoVec::new();
+        encode_shared_secret(&mut buf, &k, SharedSecretEncoding::Mpint);
+        assert_eq!(&buf[..5], &[0, 0, 0, 65, 0]);
+    }
 
     fn empty_kex() -> Sntrup761X25519Kex {
         Sntrup761X25519Kex {
