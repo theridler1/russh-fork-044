@@ -11,11 +11,12 @@
 //!   classical DH which uses `mpint`).
 
 use byteorder::{BigEndian, ByteOrder};
-use curve25519_dalek::constants::ED25519_BASEPOINT_TABLE;
 use curve25519_dalek::montgomery::MontgomeryPoint;
-use curve25519_dalek::scalar::Scalar;
 use log::debug;
 use sha2::Digest;
+use zeroize::Zeroizing;
+
+use super::curve25519::{x25519_checked, x25519_public, x25519_secret, X25519_LEN};
 
 use super::sntrup761_ffi::{
     self, CIPHERTEXT_BYTES as SNTRUP761_CIPHERTEXT_SIZE,
@@ -27,7 +28,7 @@ use crate::mac;
 use crate::session::Exchange;
 use crate::{cipher, msg, CryptoVec};
 
-const X25519_PUBLIC_KEY_SIZE: usize = 32;
+const X25519_PUBLIC_KEY_SIZE: usize = X25519_LEN;
 
 pub struct Sntrup761X25519KexType {}
 
@@ -46,7 +47,7 @@ impl KexType for Sntrup761X25519KexType {
 #[doc(hidden)]
 pub struct Sntrup761X25519Kex {
     sntrup_secret: Option<sntrup761_ffi::SecretKey>,
-    x25519_secret: Option<Scalar>,
+    x25519_secret: Option<Zeroizing<[u8; X25519_LEN]>>,
     k_pq: Option<sntrup761_ffi::SharedSecret>,
     k_cl: Option<MontgomeryPoint>,
     /// Combined shared secret (SHA-512(K_pq || K_cl)) — 64 bytes once derived.
@@ -86,7 +87,11 @@ impl KexAlgorithm for Sntrup761X25519Kex {
             return Err(crate::Error::Inconsistent);
         }
 
-        #[allow(clippy::indexing_slicing)]
+        if payload.len() < 5 {
+            return Err(crate::Error::Inconsistent);
+        }
+
+        #[allow(clippy::indexing_slicing)] // length checked
         let c_init_len = BigEndian::read_u32(&payload[1..]) as usize;
 
         if payload.len() < 5 + c_init_len {
@@ -105,18 +110,17 @@ impl KexAlgorithm for Sntrup761X25519Kex {
         #[allow(clippy::indexing_slicing)]
         let c_pk_cl_bytes = &c_init[SNTRUP761_PUBLIC_KEY_SIZE..];
 
+        // Classical half first: clamped RFC 7748 X25519, rejecting a
+        // wrong-length or low-order client share (all-zero K_cl) before any
+        // secret is combined.
+        let s_secret = x25519_secret();
+        let s_pk_cl = x25519_public(&s_secret);
+        let k_cl = x25519_checked(c_pk_cl_bytes, &s_secret)?;
+
         let mut c_pk_pq = sntrup761_ffi::PublicKey([0u8; SNTRUP761_PUBLIC_KEY_SIZE]);
         c_pk_pq.0.copy_from_slice(c_pk_pq_bytes);
 
-        let mut c_pk_cl = MontgomeryPoint([0; 32]);
-        c_pk_cl.0.copy_from_slice(c_pk_cl_bytes);
-
         let (s_ct_pq, k_pq) = sntrup761_ffi::encapsulate(&c_pk_pq).map_err(|_| crate::Error::Kex)?;
-
-        let s_secret = Scalar::from_bytes_mod_order(rand::random::<[u8; 32]>());
-        let s_pk_cl = (ED25519_BASEPOINT_TABLE * &s_secret).to_montgomery();
-
-        let k_cl = s_secret * c_pk_cl;
 
         exchange.server_ephemeral.clear();
         exchange.server_ephemeral.extend(&s_ct_pq.0);
@@ -136,8 +140,8 @@ impl KexAlgorithm for Sntrup761X25519Kex {
     ) -> Result<(), crate::Error> {
         let (sntrup_pk, sntrup_sk) = sntrup761_ffi::generate_keypair().map_err(|_| crate::Error::Kex)?;
 
-        let x25519_secret = Scalar::from_bytes_mod_order(rand::random::<[u8; 32]>());
-        let x25519_pk = (ED25519_BASEPOINT_TABLE * &x25519_secret).to_montgomery();
+        let x25519_secret = x25519_secret();
+        let x25519_pk = x25519_public(&x25519_secret);
 
         client_ephemeral.clear();
         client_ephemeral.extend(&sntrup_pk.0);
@@ -172,11 +176,10 @@ impl KexAlgorithm for Sntrup761X25519Kex {
         let sntrup_secret = self.sntrup_secret.take().ok_or(crate::Error::KexInit)?;
         let k_pq = sntrup761_ffi::decapsulate(&s_ct_pq, &sntrup_secret).map_err(|_| crate::Error::Kex)?;
 
-        let mut s_pk_cl = MontgomeryPoint([0; 32]);
-        s_pk_cl.0.copy_from_slice(s_pk_cl_bytes);
-
+        // Reject a low-order server share (all-zero K_cl) before
+        // finalize_combined_secret.
         let x25519_secret = self.x25519_secret.take().ok_or(crate::Error::KexInit)?;
-        let k_cl = x25519_secret * s_pk_cl;
+        let k_cl = x25519_checked(s_pk_cl_bytes, &x25519_secret)?;
 
         self.k_pq = Some(k_pq);
         self.k_cl = Some(k_cl);
@@ -384,5 +387,88 @@ mod tests {
 
         let invalid_reply = vec![0u8; 100];
         assert!(client_kex.compute_shared_secret(&invalid_reply).is_err());
+    }
+
+    use super::super::curve25519::tests::low_order_points;
+
+    /// Server reply = a valid sntrup761 ciphertext for the client's key,
+    /// followed by the given X25519 share.
+    fn server_reply_with_x25519(client_ephemeral: &[u8], x25519: &[u8; 32]) -> Vec<u8> {
+        let mut pk = sntrup761_ffi::PublicKey([0u8; SNTRUP761_PUBLIC_KEY_SIZE]);
+        pk.0.copy_from_slice(&client_ephemeral[..SNTRUP761_PUBLIC_KEY_SIZE]);
+        let (ct, _k) = sntrup761_ffi::encapsulate(&pk).unwrap();
+        let mut reply = ct.0.to_vec();
+        reply.extend_from_slice(x25519);
+        reply
+    }
+
+    /// Client init = KEX_ECDH_INIT + ssh-string(valid sntrup761 pk || x25519).
+    fn client_init_with_x25519(x25519: &[u8; 32]) -> Vec<u8> {
+        let (pk, _sk) = sntrup761_ffi::generate_keypair().unwrap();
+        let mut body = pk.0.to_vec();
+        body.extend_from_slice(x25519);
+        let mut p = vec![msg::KEX_ECDH_INIT];
+        p.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        p.extend_from_slice(&body);
+        p
+    }
+
+    #[test]
+    fn rejects_zero_x25519_in_server_reply() {
+        let mut client_kex = empty_kex();
+        let mut client_ephemeral = CryptoVec::new();
+        let mut client_init_buf = CryptoVec::new();
+        client_kex
+            .client_dh(&mut client_ephemeral, &mut client_init_buf)
+            .unwrap();
+        let reply = server_reply_with_x25519(&client_ephemeral, &[0u8; 32]);
+        assert!(matches!(
+            client_kex.compute_shared_secret(&reply),
+            Err(crate::Error::Kex)
+        ));
+        assert!(client_kex.shared_secret.is_none());
+    }
+
+    #[test]
+    fn rejects_zero_x25519_in_client_init() {
+        let mut server_kex = empty_kex();
+        let mut exchange = Exchange::new();
+        let res = server_kex.server_dh(&mut exchange, &client_init_with_x25519(&[0u8; 32]));
+        assert!(matches!(res, Err(crate::Error::Kex)));
+        assert!(server_kex.shared_secret.is_none());
+    }
+
+    #[test]
+    fn rejects_low_order_x25519_both_directions() {
+        for p in low_order_points() {
+            let mut client_kex = empty_kex();
+            let mut client_ephemeral = CryptoVec::new();
+            let mut client_init_buf = CryptoVec::new();
+            client_kex
+                .client_dh(&mut client_ephemeral, &mut client_init_buf)
+                .unwrap();
+            let reply = server_reply_with_x25519(&client_ephemeral, &p);
+            assert!(
+                matches!(client_kex.compute_shared_secret(&reply), Err(crate::Error::Kex)),
+                "client accepted {:02x?}",
+                p
+            );
+
+            let mut server_kex = empty_kex();
+            let res = server_kex.server_dh(&mut Exchange::new(), &client_init_with_x25519(&p));
+            assert!(
+                matches!(res, Err(crate::Error::Kex)),
+                "server accepted {:02x?}",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_client_init_does_not_panic() {
+        for payload in [&[msg::KEX_ECDH_INIT][..], &[msg::KEX_ECDH_INIT, 0, 0, 4][..]] {
+            let mut server_kex = empty_kex();
+            assert!(server_kex.server_dh(&mut Exchange::new(), payload).is_err());
+        }
     }
 }
