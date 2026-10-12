@@ -15,6 +15,11 @@ use crate::{key, protocol, Error, PublicKeyBase64};
 pub struct AgentClient<S: AsyncRead + AsyncWrite> {
     stream: S,
     buf: CryptoVec,
+    /// Set while a request/response exchange is in flight and left set if it
+    /// does not complete (I/O error, rejected frame, cancelled future). The
+    /// stream may then be mid-frame, so every later call fails fast with
+    /// `AgentProtocolError` instead of reading a stale body as a header.
+    poisoned: bool,
 }
 
 // https://tools.ietf.org/html/draft-miller-ssh-agent-00#section-4.1
@@ -25,6 +30,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         AgentClient {
             stream,
             buf: CryptoVec::new(),
+            poisoned: false,
         }
     }
 }
@@ -38,6 +44,7 @@ impl AgentClient<tokio::net::UnixStream> {
         Ok(AgentClient {
             stream,
             buf: CryptoVec::new(),
+            poisoned: false,
         })
     }
 
@@ -68,7 +75,19 @@ impl AgentClient<tokio::net::TcpStream> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
+    /// Send `self.buf` and read one response frame into it.
+    ///
+    /// If this fails for any reason (I/O error, oversized or empty frame) or
+    /// the future is dropped before it completes, the stream is no longer
+    /// frame-aligned: an oversized body, for one, is never drained. The client
+    /// is then poisoned and every later request returns `AgentProtocolError`;
+    /// drop it and reconnect.
     async fn read_response(&mut self) -> Result<(), Error> {
+        if self.poisoned {
+            return Err(Error::AgentProtocolError);
+        }
+        self.poisoned = true;
+
         // Writing the message
         self.stream.write_all(&self.buf).await?;
         self.stream.flush().await?;
@@ -92,6 +111,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         self.buf.resize(len);
         self.stream.read_exact(&mut self.buf).await?;
 
+        self.poisoned = false;
         Ok(())
     }
 
@@ -566,5 +586,39 @@ mod tests {
         let res = client.request_identities().await;
         assert!(matches!(res, Err(Error::AgentFailure)), "{:?}", res.err());
         drop(agent_end);
+    }
+
+    #[tokio::test]
+    async fn client_is_poisoned_after_a_rejected_frame() {
+        let (client_end, mut agent_end) = tokio::io::duplex(1024);
+        // Oversized header, then bytes that would parse as a valid empty
+        // IDENTITIES_ANSWER frame if the client reused the desynced stream.
+        agent_end.write_all(&[0xff, 0xff, 0xff, 0xff]).await.unwrap();
+        agent_end
+            .write_all(&[0, 0, 0, 5, msg::IDENTITIES_ANSWER, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut client = AgentClient::connect(client_end);
+        let first = client.request_identities().await;
+        assert!(matches!(first, Err(Error::AgentProtocolError)), "{:?}", first.err());
+        let second = tokio::time::timeout(Duration::from_secs(5), client.request_identities())
+            .await
+            .expect("a poisoned client must fail fast");
+        assert!(matches!(second, Err(Error::AgentProtocolError)), "{:?}", second.err());
+        drop(agent_end);
+    }
+
+    #[tokio::test]
+    async fn client_stays_usable_after_a_complete_exchange() {
+        let (client_end, mut agent_end) = tokio::io::duplex(1024);
+        for _ in 0..2 {
+            agent_end
+                .write_all(&[0, 0, 0, 5, msg::IDENTITIES_ANSWER, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        }
+        let mut client = AgentClient::connect(client_end);
+        assert!(client.request_identities().await.unwrap().is_empty());
+        assert!(client.request_identities().await.unwrap().is_empty());
     }
 }
