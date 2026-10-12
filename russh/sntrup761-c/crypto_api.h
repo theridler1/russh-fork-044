@@ -24,6 +24,14 @@ typedef uint32_t crypto_uint32;
 typedef int64_t crypto_int64;
 typedef uint64_t crypto_uint64;
 
+/*
+ * russh: build.rs passes -Darc4random_buf=russh_sntrup_randombytes and
+ * -Dcrypto_hash_sha512=russh_sntrup_sha512, so these resolve to the Rust
+ * shims in kex/sntrup761_ffi.rs and never to (or over) libc symbols.
+ * The prototype below makes the call well-typed where libc declares none.
+ * small_random32()/arc4random() is not used by sntrup761.c.
+ */
+void	arc4random_buf(void *, size_t);
 #define randombytes(buf, buf_len) arc4random_buf((buf), (buf_len))
 #define small_random32() arc4random()
 

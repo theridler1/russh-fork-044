@@ -4,6 +4,11 @@ fn main() {
         .file("sntrup761-c/optblocker.c")
         .include("sntrup761-c")
         .define("USE_SNTRUP761X25519", None)
+        // Rename the two libc-style hooks so this crate never exports global
+        // `arc4random_buf` / `crypto_hash_sha512` symbols that would interpose
+        // the system ones (see kex/sntrup761_ffi.rs).
+        .define("arc4random_buf", "russh_sntrup_randombytes")
+        .define("crypto_hash_sha512", "russh_sntrup_sha512")
         .warnings(false)
         .compile("russh_sntrup761");
 
