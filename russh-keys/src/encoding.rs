@@ -64,7 +64,12 @@ pub fn mpint_len(s: &[u8]) -> usize {
     while i < s.len() && s[i] == 0 {
         i += 1
     }
-    (if s[i] & 0x80 != 0 { 5 } else { 4 }) + s.len() - i
+    match s.get(i) {
+        // Zero (RFC 4251 §5): an empty mpint, just the length prefix.
+        None => 4,
+        Some(b) if b & 0x80 != 0 => 5 + s.len() - i,
+        Some(_) => 4 + s.len() - i,
+    }
 }
 
 impl Encoding for Vec<u8> {
@@ -92,7 +97,10 @@ impl Encoding for Vec<u8> {
             i += 1
         }
         // If the first non-zero is >= 128, write its length (u32, BE), followed by 0.
-        if s[i] & 0x80 != 0 {
+        // An all-zero value has no first non-zero byte; it used to index past
+        // the end of `s` (GHSA-5xvq-cp9x-6p6r). Zero is an empty mpint, and
+        // the `else` branch then writes a zero length and no bytes.
+        if s.get(i).map_or(false, |b| b & 0x80 != 0) {
             self.write_u32::<BigEndian>((s.len() - i + 1) as u32)
                 .unwrap();
             self.push(0)
@@ -161,7 +169,10 @@ impl Encoding for CryptoVec {
             i += 1
         }
         // If the first non-zero is >= 128, write its length (u32, BE), followed by 0.
-        if s[i] & 0x80 != 0 {
+        // An all-zero value has no first non-zero byte; it used to index past
+        // the end of `s` (GHSA-5xvq-cp9x-6p6r). Zero is an empty mpint, and
+        // the `else` branch then writes a zero length and no bytes.
+        if s.get(i).map_or(false, |b| b & 0x80 != 0) {
             self.push_u32_be((s.len() - i + 1) as u32);
             self.push(0)
         } else {
@@ -310,5 +321,43 @@ impl<'a> ssh_encoding::Reader for Position<'a> {
 
     fn remaining_len(&self) -> usize {
         self.s.len() - self.position
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GHSA-5xvq-cp9x-6p6r: an all-zero shared secret used to index past
+    /// the end of the slice. RFC 4251 §5 encodes zero as an empty mpint.
+    #[test]
+    fn mpint_of_zero_is_empty_and_does_not_panic() {
+        let zero = [0u8; 32];
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_ssh_mpint(&zero);
+        assert_eq!(v, vec![0, 0, 0, 0]);
+
+        let mut c = CryptoVec::new();
+        c.extend_ssh_mpint(&zero);
+        assert_eq!(&c[..], &[0, 0, 0, 0]);
+
+        let mut c = CryptoVec::new();
+        c.extend_ssh_mpint(&[]);
+        assert_eq!(&c[..], &[0, 0, 0, 0]);
+
+        assert_eq!(mpint_len(&zero), 4);
+        assert_eq!(mpint_len(&[]), 4);
+    }
+
+    #[test]
+    fn mpint_encoding_unchanged_for_non_zero() {
+        let mut c = CryptoVec::new();
+        c.extend_ssh_mpint(&[0, 0x80, 1]);
+        assert_eq!(&c[..], &[0, 0, 0, 3, 0, 0x80, 1]);
+        assert_eq!(mpint_len(&[0, 0x80, 1]), 7);
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_ssh_mpint(&[0, 0x7f]);
+        assert_eq!(v, vec![0, 0, 0, 1, 0x7f]);
+        assert_eq!(mpint_len(&[0, 0x7f]), 5);
     }
 }
