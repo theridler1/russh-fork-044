@@ -34,6 +34,40 @@ thread_local! {
     static SIGNATURE_BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
 }
 
+/// Upper bound on the prompt count of an SSH_MSG_USERAUTH_INFO_REQUEST.
+/// OpenSSH caps it at 100 on the server side and real servers send 1-3.
+pub(crate) const MAX_KBD_INTERACTIVE_PROMPTS: u32 = 64;
+
+/// Parses an SSH_MSG_USERAUTH_INFO_REQUEST (RFC 4256 §3.2), `buf` starting
+/// at the message number. The peer-supplied prompt count is bounded before
+/// anything is allocated (CVE-2026-48107: it used to feed
+/// `Vec::with_capacity` directly, so `u32::MAX` aborted the process).
+pub(crate) fn parse_info_request(
+    buf: &[u8],
+) -> Result<(String, String, Vec<Prompt>), crate::Error> {
+    let mut r = buf.reader(1);
+
+    let name = String::from_utf8_lossy(r.read_string().map_err(crate::Error::from)?).to_string();
+    let instructions =
+        String::from_utf8_lossy(r.read_string().map_err(crate::Error::from)?).to_string();
+    let _lang = r.read_string().map_err(crate::Error::from)?;
+    let n_prompts = r.read_u32().map_err(crate::Error::from)?;
+    if n_prompts > MAX_KBD_INTERACTIVE_PROMPTS {
+        return Err(crate::Error::Inconsistent);
+    }
+
+    let mut prompts = Vec::with_capacity((n_prompts as usize).min(8));
+    for _ in 0..n_prompts {
+        let prompt = String::from_utf8_lossy(r.read_string().map_err(crate::Error::from)?);
+        let echo = r.read_byte().map_err(crate::Error::from)? != 0;
+        prompts.push(Prompt {
+            prompt: prompt.to_string(),
+            echo,
+        });
+    }
+    Ok((name, instructions, prompts))
+}
+
 impl Session {
     pub(crate) async fn client_read_encrypted<H: Handler>(
         &mut self,
@@ -271,35 +305,7 @@ impl Session {
                             auth_request.current
                         {
                             debug!("keyboard_interactive");
-                            let mut r = buf.reader(1);
-
-                            // read fields
-                            let name = String::from_utf8_lossy(
-                                r.read_string().map_err(crate::Error::from)?,
-                            )
-                            .to_string();
-
-                            let instructions = String::from_utf8_lossy(
-                                r.read_string().map_err(crate::Error::from)?,
-                            )
-                            .to_string();
-
-                            let _lang = r.read_string().map_err(crate::Error::from)?;
-                            let n_prompts = r.read_u32().map_err(crate::Error::from)?;
-
-                            // read prompts
-                            let mut prompts = Vec::with_capacity(n_prompts.try_into().unwrap_or(0));
-                            for _i in 0..n_prompts {
-                                let prompt = String::from_utf8_lossy(
-                                    r.read_string().map_err(crate::Error::from)?,
-                                );
-
-                                let echo = r.read_byte().map_err(crate::Error::from)? != 0;
-                                prompts.push(Prompt {
-                                    prompt: prompt.to_string(),
-                                    echo,
-                                });
-                            }
+                            let (name, instructions, prompts) = parse_info_request(buf)?;
 
                             // send challenges to caller
                             self.sender
@@ -1060,5 +1066,55 @@ impl Encrypted {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info_request(n_prompts: u32, prompts: &[(&str, bool)]) -> CryptoVec {
+        let mut buf = CryptoVec::new();
+        buf.push(msg::USERAUTH_INFO_REQUEST_OR_USERAUTH_PK_OK);
+        buf.extend_ssh_string(b"name");
+        buf.extend_ssh_string(b"instructions");
+        buf.extend_ssh_string(b""); // language tag
+        buf.push_u32_be(n_prompts);
+        for (p, echo) in prompts {
+            buf.extend_ssh_string(p.as_bytes());
+            buf.push(u8::from(*echo));
+        }
+        buf
+    }
+
+    #[test]
+    fn info_request_parses_two_prompts() {
+        let buf = info_request(2, &[("Password: ", false), ("Code: ", true)]);
+        let (name, instructions, prompts) = parse_info_request(&buf).unwrap();
+        assert_eq!(name, "name");
+        assert_eq!(instructions, "instructions");
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].prompt, "Password: ");
+        assert!(!prompts[0].echo);
+        assert_eq!(prompts[1].prompt, "Code: ");
+        assert!(prompts[1].echo);
+    }
+
+    #[test]
+    fn info_request_rejects_huge_prompt_count() {
+        // Used to call Vec::with_capacity(u32::MAX) and abort on allocation.
+        let started = std::time::Instant::now();
+        let buf = info_request(u32::MAX, &[]);
+        assert!(parse_info_request(&buf).is_err());
+        let buf = info_request(MAX_KBD_INTERACTIVE_PROMPTS + 1, &[]);
+        assert!(parse_info_request(&buf).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn info_request_rejects_truncated_prompts() {
+        // Announces 3 prompts but carries 1: an error, not a panic.
+        let buf = info_request(3, &[("Password: ", false)]);
+        assert!(parse_info_request(&buf).is_err());
     }
 }
