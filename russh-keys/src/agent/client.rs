@@ -6,7 +6,7 @@ use russh_cryptovec::CryptoVec;
 use tokio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use super::{msg, Constraint};
+use super::{msg, Constraint, MAX_AGENT_FRAME_LEN};
 use crate::encoding::{Encoding, Reader};
 use crate::key::{PublicKey, SignatureHash};
 use crate::{key, protocol, Error, PublicKeyBase64};
@@ -78,9 +78,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         self.buf.resize(4);
         self.stream.read_exact(&mut self.buf).await?;
 
-        // Reading the rest of the buffer
+        // Reading the rest of the buffer. The length is peer-controlled: cap it
+        // before allocating (RUSTSEC-2026-0154), and refuse an empty frame
+        // (callers read the message type at buf[0]).
         let len = BigEndian::read_u32(&self.buf) as usize;
         self.buf.clear();
+        if len > MAX_AGENT_FRAME_LEN {
+            return Err(Error::AgentProtocolError);
+        }
+        if len == 0 {
+            return Err(Error::AgentFailure);
+        }
         self.buf.resize(len);
         self.stream.read_exact(&mut self.buf).await?;
 
@@ -510,4 +518,53 @@ fn key_blob(public: &key::PublicKey, buf: &mut CryptoVec) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::MAX_AGENT_FRAME_LEN;
+    use super::*;
+
+    #[tokio::test]
+    async fn client_rejects_oversized_frame() {
+        let (client_end, mut agent_end) = tokio::io::duplex(64);
+        // A rogue agent announces a 4 GiB frame and never sends the body.
+        agent_end.write_all(&[0xff, 0xff, 0xff, 0xff]).await.unwrap();
+        let mut client = AgentClient::connect(client_end);
+        let res = tokio::time::timeout(Duration::from_secs(5), client.request_identities())
+            .await
+            .expect("the client must not wait for the announced body");
+        assert!(matches!(res, Err(Error::AgentProtocolError)), "{:?}", res.err());
+        assert!(client.buf.capacity() <= MAX_AGENT_FRAME_LEN);
+        drop(agent_end);
+    }
+
+    #[tokio::test]
+    async fn client_accepts_frame_at_limit() {
+        let (client_end, mut agent_end) = tokio::io::duplex(MAX_AGENT_FRAME_LEN + 64);
+        let mut frame = vec![0u8; 4 + MAX_AGENT_FRAME_LEN];
+        frame[..4].copy_from_slice(&(MAX_AGENT_FRAME_LEN as u32).to_be_bytes());
+        frame[4] = msg::IDENTITIES_ANSWER; // followed by n_keys = 0 and padding
+        agent_end.write_all(&frame).await.unwrap();
+        let mut client = AgentClient::connect(client_end);
+        let keys = tokio::time::timeout(Duration::from_secs(5), client.request_identities())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(keys.is_empty());
+        assert!(client.buf.capacity() <= MAX_AGENT_FRAME_LEN);
+    }
+
+    #[tokio::test]
+    async fn client_rejects_zero_length_frame() {
+        let (client_end, mut agent_end) = tokio::io::duplex(64);
+        agent_end.write_all(&[0, 0, 0, 0]).await.unwrap();
+        let mut client = AgentClient::connect(client_end);
+        // Used to index buf[0] on an empty buffer and panic.
+        let res = client.request_identities().await;
+        assert!(matches!(res, Err(Error::AgentFailure)), "{:?}", res.err());
+        drop(agent_end);
+    }
 }

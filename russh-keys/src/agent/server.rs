@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::sleep;
 use {std, tokio};
 
-use super::{msg, Constraint};
+use super::{msg, Constraint, MAX_AGENT_FRAME_LEN};
 use crate::encoding::{Encoding, Position, Reader};
 use crate::{key, Error};
 
@@ -107,9 +107,13 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
             self.buf.clear();
             self.buf.resize(4);
             self.s.read_exact(&mut self.buf).await?;
-            // Reading the rest of the buffer
+            // Reading the rest of the buffer. Cap the peer-controlled length
+            // before allocating (RUSTSEC-2026-0154).
             let len = BigEndian::read_u32(&self.buf) as usize;
             self.buf.clear();
+            if len > MAX_AGENT_FRAME_LEN {
+                return Err(Error::AgentProtocolError);
+            }
             self.buf.resize(len);
             self.s.read_exact(&mut self.buf).await?;
             // respond
@@ -337,5 +341,33 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         BigEndian::write_u32(writebuf, (len - 4) as u32);
 
         Ok((agent, true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::MAX_AGENT_FRAME_LEN;
+    use super::*;
+
+    #[tokio::test]
+    async fn server_rejects_oversized_frame() {
+        let (server_end, mut client_end) = tokio::io::duplex(64);
+        // A rogue client announces a 4 GiB request and never sends the body.
+        client_end.write_all(&[0xff, 0xff, 0xff, 0xff]).await.unwrap();
+        let conn = Connection {
+            lock: Lock(Arc::new(RwLock::new(CryptoVec::new()))),
+            keys: KeyStore(Arc::new(RwLock::new(HashMap::new()))),
+            agent: Some(()),
+            s: server_end,
+            buf: CryptoVec::new(),
+        };
+        let res = tokio::time::timeout(Duration::from_secs(5), conn.run())
+            .await
+            .expect("the server must not wait for the announced body");
+        assert!(matches!(res, Err(Error::AgentProtocolError)), "{:?}", res.err());
+        assert_eq!(MAX_AGENT_FRAME_LEN, 256 * 1024);
+        drop(client_end);
     }
 }

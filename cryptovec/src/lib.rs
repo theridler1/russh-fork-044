@@ -220,6 +220,15 @@ impl CryptoVec {
         self.size
     }
 
+    /// Number of bytes currently allocated (and locked) for this `CryptoVec`.
+    ///
+    /// ```
+    /// assert!(russh_cryptovec::CryptoVec::with_capacity(5).capacity() >= 5)
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Returns `true` if and only if this CryptoVec is empty.
     ///
     /// ```
